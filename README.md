@@ -6,7 +6,7 @@
 
 ---
 
-## ✨ 功能特点
+## 功能特点
 
 - ✅ **自动监控 Minecraft 清单（version_manifest_v2.json）**  
 - ✅ **支持 Snapshot / Release 两种更新渠道**

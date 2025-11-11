@@ -1,0 +1,231 @@
+import asyncio
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from typing import Dict, Any, Optional
+
+import httpx
+
+# AstrBot API（v3/v4系）
+from astrbot.api.all import (
+    register, command, Context, Star, AstrMessageEvent,
+    MessageChain, Plain, logger
+)
+# 持久化目录工具（来自知识库插件用法）
+from astrbot.api.star import StarTools  # 提供 get_data_dir() 等工具  # noqa
+
+MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+
+def _ts():
+    return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+
+def format_article_url(lang: str, version_id: str) -> str:
+    """
+    仅对 snapshot（如 25w45a）拼出官方文章链接：
+    https://www.minecraft.net/{lang}/article/minecraft-snapshot-25w45a
+    对于 release（1.xx.x）官方文章标题不一定统一，这里先不强拼。
+    """
+    vid = version_id.lower()
+    if any(tag in vid for tag in ["w", "pre", "rc"]):  # 25w45a / 1.21-pre1 / 1.21-rc1
+        slug = vid.replace(" ", "").replace("_", "-")
+        return f"https://www.minecraft.net/{lang}/article/minecraft-snapshot-{slug}"
+    return ""
+
+class State:
+    def __init__(self, path: Path):
+        self.path = path
+        self.last_snapshot_id: Optional[str] = None
+        self.last_release_id: Optional[str] = None
+        self.targets: set[str] = set()  # unified_msg_origin 列表
+        self.etag: Optional[str] = None
+
+    def load(self):
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text("utf-8"))
+                self.last_snapshot_id = data.get("last_snapshot_id")
+                self.last_release_id = data.get("last_release_id")
+                self.targets = set(data.get("targets", []))
+                self.etag = data.get("etag")
+            except Exception:
+                logger.warning("MCWatcher: state 文件损坏，忽略。")
+
+    def save(self):
+        data = {
+            "last_snapshot_id": self.last_snapshot_id,
+            "last_release_id": self.last_release_id,
+            "targets": list(self.targets),
+            "etag": self.etag,
+        }
+        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
+@register(
+    "astrbot_plugin_mcwatcher", "you",
+    "自动监听 Minecraft 版本更新并转发（支持 snapshot / release）",
+    "0.1.0", "https://example.com/your-repo"
+)
+class MCWatcher(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.ctx = context
+
+        # 读取配置（无则使用默认）
+        self.poll_seconds: int = int(context.get("poll_seconds", 120))
+        self.tz_name: str = context.get("timezone", "Asia/Ho_Chi_Minh")
+        self.watch_channels: set[str] = set(context.get("watch_channels", ["snapshot"]))
+        self.article_lang: str = context.get("mc_article_lang", "en-us")
+
+        # 持久化目录
+        data_dir = Path(StarTools.get_data_dir("astrbot_plugin_mcwatcher"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.state = State(data_dir / "state.json")
+        self.state.load()
+
+        # 异步轮询任务
+        self._stop = False
+        self._task = asyncio.create_task(self._poll_loop())
+        logger.info(f"{_ts()} MCWatcher started. interval={self.poll_seconds}s tz={self.tz_name} watch={self.watch_channels}")
+
+    async def terminate(self):
+        # 插件卸载时会调用
+        self._stop = True
+        try:
+            if self._task:
+                self._task.cancel()
+        except Exception:
+            pass
+        self.state.save()
+        logger.info(f"{_ts()} MCWatcher terminated.")
+
+    # ============ 指令：绑定/解绑/状态/立即检查 ============
+    @command("mcwatch bind", alias={"mcwatch on", "mc订阅"})
+    async def bind_here(self, event: AstrMessageEvent):
+        sid = event.unified_msg_origin
+        self.state.targets.add(sid)
+        self.state.save()
+        yield event.plain_result("✅ 已绑定当前会话，后续有更新将推送到这里。")
+
+    @command("mcwatch unbind", alias={"mcwatch off", "取消mc订阅"})
+    async def unbind_here(self, event: AstrMessageEvent):
+        sid = event.unified_msg_origin
+        if sid in self.state.targets:
+            self.state.targets.remove(sid)
+            self.state.save()
+            yield event.plain_result("✅ 已取消本会话的推送。")
+        else:
+            yield event.plain_result("（本会话未绑定，无需取消）")
+
+    @command("mcwatch list", alias={"mcwatch status", "mc订阅列表"})
+    async def list_targets(self, event: AstrMessageEvent):
+        if not self.state.targets:
+            yield event.plain_result("暂无绑定会话。用 `mcwatch bind` 绑定当前会话。")
+            return
+        txt = "已绑定会话：\n" + "\n".join(f"- {t}" for t in sorted(self.state.targets))
+        yield event.plain_result(txt)
+
+    @command("mcwatch now", alias={"立即检查mc"})
+    async def check_now(self, event: AstrMessageEvent):
+        await self._check_once(force_push=True)
+        yield event.plain_result("OK，已主动检查一次。")
+
+    # ================= 核心：轮询 + 检查 ===================
+    async def _poll_loop(self):
+        # 首次启动立即检查一次，然后按间隔轮询
+        try:
+            await self._check_once(force_push=False)
+        except Exception as e:
+            logger.warning(f"MCWatcher first check failed: {e}", exc_info=True)
+
+        while not self._stop:
+            try:
+                await asyncio.sleep(self.poll_seconds)
+                await self._check_once(force_push=False)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"MCWatcher loop error: {e}", exc_info=True)
+
+    async def _fetch_manifest(self) -> Optional[Dict[str, Any]]:
+        headers = {}
+        if self.state.etag:
+            headers["If-None-Match"] = self.state.etag
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(MANIFEST_URL, headers=headers)
+            if resp.status_code == 304:
+                return None  # 未变化
+            resp.raise_for_status()
+            etag = resp.headers.get("ETag")
+            if etag:
+                self.state.etag = etag
+                self.state.save()
+            return resp.json()
+
+    async def _check_once(self, force_push: bool):
+        data = await self._fetch_manifest()
+        if data is None and not force_push:
+            # 未变化
+            return
+
+        latest = (data or {}).get("latest", {}) if data else {}
+        # 读取最新 snapshot / release（两个都可监听）
+        updated_msgs = []
+
+        if "snapshot" in self.watch_channels:
+            sid = latest.get("snapshot")
+            if sid and sid != self.state.last_snapshot_id:
+                t = self._lookup_release_time(data, sid)
+                updated_msgs.append(self._build_message("snapshot", sid, t))
+                self.state.last_snapshot_id = sid
+
+        if "release" in self.watch_channels:
+            rid = latest.get("release")
+            if rid and rid != self.state.last_release_id:
+                t = self._lookup_release_time(data, rid)
+                updated_msgs.append(self._build_message("release", rid, t))
+                self.state.last_release_id = rid
+
+        if updated_msgs:
+            self.state.save()
+            await self._broadcast("\n\n".join(updated_msgs), self.state.targets)
+
+    def _lookup_release_time(self, data: Optional[Dict[str, Any]], vid: str) -> Optional[str]:
+        if not data:
+            return None
+        for v in data.get("versions", []):
+            if v.get("id") == vid:
+                return v.get("releaseTime")
+        return None
+
+    def _build_message(self, vtype: str, vid: str, release_iso: Optional[str]) -> str:
+        # 格式化时间
+        dt_str = "未知时间"
+        if release_iso:
+            try:
+                dt = datetime.fromisoformat(release_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(self.tz_name))
+                dt_str = dt.strftime("%Y-%m-%d %H:%M:%S %z")
+            except Exception:
+                dt_str = release_iso
+
+        # 文章链接（优先为 snapshot 场景生成）
+        article = format_article_url(self.article_lang, vid) if vtype == "snapshot" else ""
+
+        lines = [f"发现MC更新：{vid} ({vtype})", f"时间：{dt_str}"]
+        if article:
+            lines.append(f"Changelog：{article}")
+        return "\n".join(lines)
+
+    async def _broadcast(self, text: str, targets: set[str]):
+        if not targets:
+            logger.info("MCWatcher: 无推送目标，跳过广播。")
+            return
+        mc = MessageChain([Plain(text)])
+        ok = 0
+        for sid in list(targets):
+            try:
+                sent = self.ctx.send_message(sid, mc)
+                ok += 1 if sent else 0
+            except Exception as e:
+                logger.warning(f"send to {sid} failed: {e}", exc_info=True)
+        logger.info(f"{_ts()} MCWatcher pushed to {ok}/{len(targets)} targets.")

@@ -64,7 +64,7 @@ class State:
 @register(
     "astrbot_plugin_mcwatcher",
     "noname2309-bot",
-    "自动监听 Minecraft 版本更新并推送（支持 snapshot / release）",
+    "MCWatcher 是一个基于 AstrBot 的插件，用于 自动监测 Mojang 的最新 Minecraft 版本",
     "0.2.2",
     "https://github.com/wadadawsd/astrbot_plugin_mcwatcher"
 )
@@ -75,9 +75,7 @@ class MCWatcher(Star):
         self.config = config or {}
 
         def cfg(key: str, default):
-            if isinstance(self.config, dict):
-                return self.config.get(key, default)
-            return default
+            return self.config.get(key, default) if isinstance(self.config, dict) else default
 
         self.poll_seconds = int(cfg("interval_seconds", cfg("poll_seconds", 120)))
         self.tz_name = cfg("timezone", "Asia/Shanghai")
@@ -109,21 +107,28 @@ class MCWatcher(Star):
         logger.info(f"{_ts()} MCWatcher terminated.")
 
     # ========= 工具 =========
+
     def _get_plain_text(self, event: AstrMessageEvent) -> str:
+        """抽取纯文本并记录异常"""
         try:
             mc = getattr(event, "message_chain", None)
             if mc:
                 parts = []
                 for seg in mc:
                     if isinstance(seg, Plain):
-                        parts.append(
-                            getattr(seg, "text", "")
-                            or getattr(seg, "content", "")
-                        )
+                        parts.append(getattr(seg, "text", "") or getattr(seg, "content", ""))
                 return "".join(parts)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get plain text: {e}", exc_info=True)
         return ""
+
+    # --- 统一解析 fake / fake_release 参数 ---
+    def _parse_fake_version(self, raw: str, keyword: str, default_vid: str) -> str:
+        toks = raw.replace("\u3000", " ").split()
+        for i, t in enumerate(toks):
+            if t.lower() == keyword:
+                return toks[i + 1] if i + 1 < len(toks) else default_vid
+        return toks[1] if len(toks) > 1 else default_vid
 
     # ========= 指令 =========
 
@@ -162,15 +167,7 @@ class MCWatcher(Star):
     @command("mcwatch fake")
     async def fake_snapshot(self, event: AstrMessageEvent):
         raw = (self._get_plain_text(event) or "").strip()
-
-        def parse_vid(s: str, default_vid: str):
-            toks = s.replace("\u3000", " ").split()
-            for i, t in enumerate(toks):
-                if t.lower() == "fake":
-                    return toks[i + 1] if i + 1 < len(toks) else default_vid
-            return toks[1] if len(toks) > 1 else default_vid
-
-        vid = parse_vid(raw, "25w45a")
+        vid = self._parse_fake_version(raw, "fake", "25w45a")
         msg = self._build_message("snapshot", vid, datetime.now().isoformat())
         await self._broadcast(msg, self.state.targets)
         yield event.plain_result(f"已模拟 snapshot 推送：{vid}")
@@ -178,15 +175,7 @@ class MCWatcher(Star):
     @command("mcwatch fake_release")
     async def fake_release(self, event: AstrMessageEvent):
         raw = (self._get_plain_text(event) or "").strip()
-
-        def parse_vid(s: str, default_vid: str):
-            toks = s.replace("\u3000", " ").split()
-            for i, t in enumerate(toks):
-                if t.lower() == "fake_release":
-                    return toks[i + 1] if i + 1 < len(toks) else default_vid
-            return toks[1] if len(toks) > 1 else default_vid
-
-        vid = parse_vid(raw, "1.21.3")
+        vid = self._parse_fake_version(raw, "fake_release", "1.21.3")
         msg = self._build_message("release", vid, datetime.now().isoformat())
         await self._broadcast(msg, self.state.targets)
         yield event.plain_result(f"已模拟 release 推送：{vid}")
@@ -281,22 +270,23 @@ class MCWatcher(Star):
 
         return "\n".join(lines)
 
+    # ========= 高性能并发广播 =========
     async def _broadcast(self, text: str, targets: Set[str]):
         if not targets:
             return
 
         mc = MessageChain([Plain(text)])
-        ok = 0
+        target_list = list(targets)
 
-        for sid in list(targets):
-            try:
-                sent = await self.ctx.send_message(sid, mc)
-                if sent:
-                    ok += 1
-            except Exception as e:
-                logger.warning(
-                    f"{_ts()} 推送失败 {sid}: {e}", exc_info=True
-                )
+        tasks = [self.ctx.send_message(sid, mc) for sid in target_list]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        ok = 0
+        for sid, result in zip(target_list, results):
+            if isinstance(result, Exception):
+                logger.warning(f"{_ts()} 推送失败 {sid}: {result}", exc_info=True)
+            elif result:
+                ok += 1
 
         logger.info(f"{_ts()} MCWatcher 已推送 {ok}/{len(targets)} 个会话。")
 

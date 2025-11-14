@@ -8,10 +8,9 @@ import httpx
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api.all import (
-    register, Context, Star, AstrMessageEvent,
+    register, command, Context, Star, AstrMessageEvent,
     MessageChain, Plain, logger
 )
-from astrbot.api.event import filter
 from astrbot.api.star import StarTools
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -56,7 +55,7 @@ class State:
                 self.targets = set(data.get("targets", []))
                 self.etag = data.get("etag")
             except (json.JSONDecodeError, KeyError, OSError) as e:
-                logger.warning(f"{_ts()} state 文件异常，已忽略：{e}")
+                logger.warning(f"{_ts()} state 文件异常：{e}")
 
     def save(self):
         data = {
@@ -74,7 +73,7 @@ class State:
 @register(
     "astrbot_plugin_mcwatcher", "you",
     "自动监听 Minecraft 更新（snapshot / release）",
-    "0.2.0", "https://github.com/noname2309-bot/astrbot_plugin_mcwatcher"
+    "0.2.0", "https://github.com/wadadawsd/astrbot_plugin_mcwatcher"
 )
 class MCWatcher(Star):
     def __init__(self, context: Context):
@@ -107,26 +106,26 @@ class MCWatcher(Star):
         self.state.save()
         logger.info(f"{_ts()} MCWatcher terminated.")
 
-    # ------------------ commands ------------------
+    # ------------------ commands (旧版格式) ------------------
 
-    @filter.command("mcwatch bind", alias={"mcwatch on", "mc订阅"})
+    @command("mcwatch bind", alias={"mcwatch on"})
     async def bind_here(self, event: AstrMessageEvent):
         sid = event.unified_msg_origin
         self.state.targets.add(sid)
         self.state.save()
         yield event.plain_result("已绑定本会话。")
 
-    @filter.command("mcwatch unbind", alias={"mcwatch off", "取消mc订阅"})
+    @command("mcwatch unbind", alias={"mcwatch off"})
     async def unbind_here(self, event: AstrMessageEvent):
         sid = event.unified_msg_origin
         if sid in self.state.targets:
             self.state.targets.remove(sid)
             self.state.save()
-            yield event.plain_result("已取消推送。")
+            yield event.plain_result("已取消绑定。")
         else:
             yield event.plain_result("本会话未绑定。")
 
-    @filter.command("mcwatch list")
+    @command("mcwatch list")
     async def list_targets(self, event: AstrMessageEvent):
         if not self.state.targets:
             yield event.plain_result("暂无绑定会话。")
@@ -134,12 +133,12 @@ class MCWatcher(Star):
             txt = "已绑定：\n" + "\n".join(sorted(self.state.targets))
             yield event.plain_result(txt)
 
-    @filter.command("mcwatch now")
+    @command("mcwatch now")
     async def check_now(self, event: AstrMessageEvent):
         await self._check_once(force_push=True)
         yield event.plain_result("已检查。")
 
-    @filter.command("mcwatch fake")
+    @command("mcwatch fake")
     async def fake_snapshot(self, event: AstrMessageEvent):
         default_vid = self.state.last_snapshot_id or "latest-snapshot"
         raw = getattr(event, "get_plain_text", lambda: "")()
@@ -148,7 +147,7 @@ class MCWatcher(Star):
         await self._broadcast(msg, self.state.targets or {event.unified_msg_origin})
         yield event.plain_result(f"已伪造 snapshot：{vid}")
 
-    @filter.command("mcwatch fake_release")
+    @command("mcwatch fake_release")
     async def fake_release(self, event: AstrMessageEvent):
         default_vid = self.state.last_release_id or "latest-release"
         raw = getattr(event, "get_plain_text", lambda: "")()
@@ -197,7 +196,7 @@ class MCWatcher(Star):
         if data is None and not force_push:
             return
 
-        latest = (data or {}).get("latest", {}) if data else {}
+        latest = (data or {}).get("latest", {})
         msgs = []
 
         if "snapshot" in self.watch_channels:
@@ -259,6 +258,4 @@ class MCWatcher(Star):
                 logger.warning(f"{_ts()} 推送失败 {sid}: {e}", exc_info=True)
 
         logger.info(f"{_ts()} 推送完成：{ok}/{len(targets)}")
-
-
 

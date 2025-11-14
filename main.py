@@ -1,5 +1,3 @@
-
-
 def format_article_url(lang: str, version_id: str) -> str:
     vid = version_id.lower()
     vid = (version_id or "").lower()
@@ -138,6 +136,7 @@ class MCWatcher(Star):
             return
 @@ -252,3 +287,5 @@ async def _broadcast(self, text: str, targets: set[str]):
         logger.info(f"{_ts()} MCWatcher pushed to {ok}/{len(targets)} targets.")
+
 
 
 

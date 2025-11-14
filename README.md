@@ -69,11 +69,13 @@
 | mc_article_lang | en-us | 官方文章语言，如 zh-hans、en-us 等 |
 
 ---
-🧩 捕获示例推送
+ 捕获示例推送
+ ```
 MC 更新：25w45a (snapshot)
 时间：2025-11-10 23:41:12 +0800
 日志：https://www.minecraft.net/zh-hans/article/minecraft-snapshot-25w45a
 
+```
 ❤️ 贡献
 
 欢迎提交：

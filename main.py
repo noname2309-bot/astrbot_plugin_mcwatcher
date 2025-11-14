@@ -11,6 +11,7 @@ from astrbot.api.all import (
     register, command, Context, Star, AstrMessageEvent,
     MessageChain, Plain, logger
 )
+
 from astrbot.api.star import StarTools
 
 
@@ -38,15 +39,16 @@ class State:
         self.etag: Optional[str] = None
 
     def load(self):
-        if self.path.exists():
-            try:
-                data = json.loads(self.path.read_text("utf-8"))
-                self.last_snapshot_id = data.get("last_snapshot_id")
-                self.last_release_id = data.get("last_release_id")
-                self.targets = set(data.get("targets", []))
-                self.etag = data.get("etag")
-            except (json.JSONDecodeError, KeyError, OSError) as e:
-                logger.warning(f"{_ts()} state 文件异常：{e}")
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text("utf-8"))
+            self.last_snapshot_id = data.get("last_snapshot_id")
+            self.last_release_id = data.get("last_release_id")
+            self.targets = set(data.get("targets", []))
+            self.etag = data.get("etag")
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            logger.warning(f"{_ts()} state 文件异常：{e}")
 
     def save(self):
         data = {
@@ -65,17 +67,21 @@ class State:
     "astrbot_plugin_mcwatcher",
     "noname2309-bot",
     "MCWatcher 是一个基于 AstrBot 的插件，用于 自动监测 Mojang 的最新 Minecraft 版本",
-    "0.2.2",
+    "0.2.3",
     "https://github.com/wadadawsd/astrbot_plugin_mcwatcher"
 )
 class MCWatcher(Star):
+
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None, **kwargs):
         super().__init__(context)
-        self.ctx = context
-        self.config = config or {}
+
+        # ★ 修复项 2：确保 config 一定是 dict
+        self.config: Dict[str, Any] = config or {}
 
         def cfg(key: str, default):
-            return self.config.get(key, default) if isinstance(self.config, dict) else default
+            return self.config.get(key, default)
+
+        self.ctx = context
 
         self.poll_seconds = int(cfg("interval_seconds", cfg("poll_seconds", 120)))
         self.tz_name = cfg("timezone", "Asia/Shanghai")
@@ -91,9 +97,7 @@ class MCWatcher(Star):
         self._stop = False
         self._task = asyncio.create_task(self._poll_loop())
 
-        logger.info(
-            f"{_ts()} MCWatcher started. interval={self.poll_seconds}s tz={self.tz_name} watch={self.watch_channels}"
-        )
+        logger.info(f"{_ts()} MCWatcher started. interval={self.poll_seconds}s tz={self.tz_name} watch={self.watch_channels}")
 
     async def terminate(self):
         self._stop = True
@@ -104,31 +108,41 @@ class MCWatcher(Star):
             except asyncio.CancelledError:
                 pass
         self.state.save()
-        logger.info(f"{_ts()} MCWatcher terminated.")
 
     # ========= 工具 =========
 
+    # ★ 修复项 3：捕获更具体的异常
     def _get_plain_text(self, event: AstrMessageEvent) -> str:
-        """抽取纯文本并记录异常"""
         try:
             mc = getattr(event, "message_chain", None)
+            parts = []
             if mc:
-                parts = []
                 for seg in mc:
                     if isinstance(seg, Plain):
                         parts.append(getattr(seg, "text", "") or getattr(seg, "content", ""))
-                return "".join(parts)
-        except Exception as e:
-            logger.warning(f"Failed to get plain text: {e}", exc_info=True)
+            return "".join(parts)
+        except (AttributeError, TypeError) as e:
+            logger.warning(f"Failed to parse plain text: {e}", exc_info=True)
         return ""
 
-    # --- 统一解析 fake / fake_release 参数 ---
+    # ========= 辅助函数 =========
+
+    # ★ 修复项 1：避免 toks[1] 返回 “fake”
     def _parse_fake_version(self, raw: str, keyword: str, default_vid: str) -> str:
         toks = raw.replace("\u3000", " ").split()
         for i, t in enumerate(toks):
             if t.lower() == keyword:
+                # 返回 keyword 后面的内容
                 return toks[i + 1] if i + 1 < len(toks) else default_vid
-        return toks[1] if len(toks) > 1 else default_vid
+
+        # 额外修复：
+        # 如果命令只有 "mcwatch fake" → 不返回 toks[1]（它是 'fake'）
+        # 必须使用 default_vid
+        if len(toks) <= 2:
+            return default_vid
+
+        # 形如 "mcwatch fake 25w45a" 的情形
+        return toks[2]
 
     # ========= 指令 =========
 
@@ -154,19 +168,16 @@ class MCWatcher(Star):
         if not self.state.targets:
             yield event.plain_result("暂无绑定会话。")
         else:
-            txt = "已绑定：\n" + "\n".join(sorted(self.state.targets))
-            yield event.plain_result(txt)
+            yield event.plain_result("已绑定：\n" + "\n".join(sorted(self.state.targets)))
 
     @command("mcwatch now")
     async def check_now(self, event: AstrMessageEvent):
         await self._check_once(force_push=True)
         yield event.plain_result("OK，已主动检查一次。")
 
-    # === 模拟推送 ===
-
     @command("mcwatch fake")
     async def fake_snapshot(self, event: AstrMessageEvent):
-        raw = (self._get_plain_text(event) or "").strip()
+        raw = self._get_plain_text(event).strip()
         vid = self._parse_fake_version(raw, "fake", "25w45a")
         msg = self._build_message("snapshot", vid, datetime.now().isoformat())
         await self._broadcast(msg, self.state.targets)
@@ -174,7 +185,7 @@ class MCWatcher(Star):
 
     @command("mcwatch fake_release")
     async def fake_release(self, event: AstrMessageEvent):
-        raw = (self._get_plain_text(event) or "").strip()
+        raw = self._get_plain_text(event).strip()
         vid = self._parse_fake_version(raw, "fake_release", "1.21.3")
         msg = self._build_message("release", vid, datetime.now().isoformat())
         await self._broadcast(msg, self.state.targets)
@@ -184,14 +195,14 @@ class MCWatcher(Star):
 
     async def _poll_loop(self):
         try:
-            await self._check_once(force_push=False)
+            await self._check_once(False)
         except Exception as e:
             logger.warning(f"MCWatcher 首次检查异常：{e}", exc_info=True)
 
         while not self._stop:
             try:
                 await asyncio.sleep(self.poll_seconds)
-                await self._check_once(force_push=False)
+                await self._check_once(False)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -199,12 +210,11 @@ class MCWatcher(Star):
 
     async def _fetch_manifest(self, ignore_cache: bool = False):
         headers = {}
-        if (not ignore_cache) and self.state.etag:
+        if not ignore_cache and self.state.etag:
             headers["If-None-Match"] = self.state.etag
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(MANIFEST_URL, headers=headers)
-
             if resp.status_code == 304:
                 return None
 
@@ -255,16 +265,17 @@ class MCWatcher(Star):
         dt_str = "未知时间"
         if release_iso:
             try:
-                dt = datetime.fromisoformat(
-                    release_iso.replace("Z", "+00:00")
-                ).astimezone(ZoneInfo(self.tz_name))
+                dt = datetime.fromisoformat(release_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(self.tz_name))
                 dt_str = dt.strftime("%Y-%m-%d %H:%M:%S %z")
             except (ValueError, ZoneInfoNotFoundError):
                 dt_str = release_iso
 
         article = format_article_url(self.article_lang, vid) if vtype == "snapshot" else ""
 
-        lines = [f"MC 更新：{vid} ({vtype})", f"时间：{dt_str}"]
+        lines = [
+            f"MC 更新：{vid} ({vtype})",
+            f"时间：{dt_str}"
+        ]
         if article:
             lines.append(f"日志：{article}")
 
@@ -276,13 +287,13 @@ class MCWatcher(Star):
             return
 
         mc = MessageChain([Plain(text)])
-        target_list = list(targets)
+        sid_list = list(targets)
 
-        tasks = [self.ctx.send_message(sid, mc) for sid in target_list]
+        tasks = [self.ctx.send_message(sid, mc) for sid in sid_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         ok = 0
-        for sid, result in zip(target_list, results):
+        for sid, result in zip(sid_list, results):
             if isinstance(result, Exception):
                 logger.warning(f"{_ts()} 推送失败 {sid}: {result}", exc_info=True)
             elif result:

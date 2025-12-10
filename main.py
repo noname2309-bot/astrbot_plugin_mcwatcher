@@ -1,5 +1,7 @@
+
 import asyncio
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, Set
@@ -22,12 +24,46 @@ def _ts():
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 
 
+# ========== 已改进版本的文章链接生成函数 ==========
 def format_article_url(lang: str, version_id: str) -> str:
     vid = (version_id or "").lower()
-    if any(tag in vid for tag in ["w", "pre", "rc"]):
+
+    def _join_parts(match: re.Match) -> str:
+        parts = [match.group("major"), match.group("minor")]
+        patch = match.group("patch")
+        if patch is not None:
+            parts.append(patch)
+        return "-".join(parts)
+
+    # pre-release: minecraft-1-a-b-pre-release-c
+    pre_match = re.match(
+        r"^(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?-pre(?P<build>\d+)$",
+        vid,
+    )
+    if pre_match:
+        slug = _join_parts(pre_match)
+        build = pre_match.group("build")
+        return f"https://www.minecraft.net/{lang}/article/minecraft-{slug}-pre-release-{build}"
+
+    # RC: minecraft-1-a-b-release-candidate-c
+    rc_match = re.match(
+        r"^(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?-rc(?P<build>\d+)$",
+        vid,
+    )
+    if rc_match:
+        slug = _join_parts(rc_match)
+        build = rc_match.group("build")
+        return f"https://www.minecraft.net/{lang}/article/minecraft-{slug}-release-candidate-{build}"
+
+    # Snapshot，例如 25w46a
+    if "w" in vid:
         slug = vid.replace(" ", "").replace("_", "-")
         return f"https://www.minecraft.net/{lang}/article/minecraft-snapshot-{slug}"
+
     return ""
+
+
+# ===================================================
 
 
 class State:
@@ -75,7 +111,6 @@ class MCWatcher(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None, **kwargs):
         super().__init__(context)
 
-        # 保证 config 必为 dict
         self.config: Dict[str, Any] = config or {}
         self.ctx = context
 
@@ -110,10 +145,9 @@ class MCWatcher(Star):
                 pass
         self.state.save()
 
-    # ========== 工具 ==========
+    # ========== 工具方法 ==========
 
     def _get_plain_text(self, event: AstrMessageEvent) -> str:
-        """提取消息纯文本，捕获更具体异常"""
         try:
             mc = getattr(event, "message_chain", None)
             if mc:
@@ -127,22 +161,18 @@ class MCWatcher(Star):
         return ""
 
     def _parse_fake_version(self, raw: str, keyword: str, default_vid: str) -> str:
-        """更健壮的 fake 参数解析"""
         toks = raw.replace("\u3000", " ").split()
         tokens_lower = [t.lower() for t in toks]
 
-        # 形如：mcwatch fake 25w45a
         if keyword in tokens_lower:
             idx = tokens_lower.index(keyword)
             if idx + 1 < len(toks):
                 return toks[idx + 1]
             return default_vid
 
-        # 避免返回 toks[1] == "fake"
         if len(toks) <= 2:
             return default_vid
 
-        # 假如输入：mcwatch fake 25w45a → 一般 toks[2] 为版本号
         return toks[2]
 
     # ========== 指令 ==========
@@ -176,7 +206,7 @@ class MCWatcher(Star):
         await self._check_once(force_push=True)
         yield event.plain_result("OK，已主动检查一次。")
 
-    # === fake 推送（仅当前会话，不广播） ===
+    # ========== fake 推送（仅当前会话，不广播） ==========
 
     @command("mcwatch fake")
     async def fake_snapshot(self, event: AstrMessageEvent):
@@ -184,9 +214,7 @@ class MCWatcher(Star):
         vid = self._parse_fake_version(raw, "fake", "25w45a")
         msg = self._build_message("snapshot", vid, datetime.now().isoformat())
 
-        # 修复：只发到当前会话，不广播
         await self.ctx.send_message(event.unified_msg_origin, MessageChain([Plain(msg)]))
-
         yield event.plain_result(f"已模拟 snapshot 推送：{vid}")
 
     @command("mcwatch fake_release")
@@ -195,9 +223,7 @@ class MCWatcher(Star):
         vid = self._parse_fake_version(raw, "fake_release", "1.21.3")
         msg = self._build_message("release", vid, datetime.now().isoformat())
 
-        # 修复：只发到当前会话，不广播
         await self.ctx.send_message(event.unified_msg_origin, MessageChain([Plain(msg)]))
-
         yield event.plain_result(f"已模拟 release 推送：{vid}")
 
     # ========== 轮询 ==========
@@ -223,7 +249,7 @@ class MCWatcher(Star):
             headers["If-None-Match"] = self.state.etag
 
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(MANIFEST_URL, headers=headers)
+            resp = await client.get(MAN행법_URL, headers=headers)
 
             if resp.status_code == 304:
                 return None
@@ -293,8 +319,7 @@ class MCWatcher(Star):
 
         return "\n".join(lines)
 
-    # ========== 高性能并发广播（正式推送） ==========
-
+    # ========== 高性能并发广播 ==========
     async def _broadcast(self, text: str, targets: Set[str]):
         if not targets:
             return
@@ -313,8 +338,3 @@ class MCWatcher(Star):
                 ok += 1
 
         logger.info(f"{_ts()} MCWatcher 已推送 {ok}/{len(targets)} 个会话。")
-
-
-
-
-
